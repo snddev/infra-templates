@@ -1,0 +1,280 @@
+{
+    "AWSTemplateFormatVersion": "2010-09-09",
+    "Description": "CF Template to Create Backup Infrastructure via Snapshots",
+    "Parameters" : {
+        "SnapshotCreateCRON" : {
+            "Type" : "String",
+            "Description" : "Enter CRON value for creating Snapshot in UTC time. For Example, entering 'cron(15 12 * * ? *)' will set the trigger to create new snapshots at 12:15 UTC, every day"
+        },
+        "SnapshotDeleteCRON" : {
+            "Type" : "String",
+            "Description" : "Enter CRON value for deleting Snapshot in UTC time. For Example, entering 'cron(15 12 * * ? *)' will set the trigger to cleanup old snapshots at 12:15 UTC, every day"
+        }
+    },
+
+    "Resources": {
+        "SnapshotCreateRule": {
+            "Type": "AWS::Events::Rule",
+            "Properties": {
+                "Description": "ScheduledRule to create Snapshots",
+                "ScheduleExpression": { "Ref" : "SnapshotCreateCRON" },
+                "State": "ENABLED",
+                "Targets": [{
+                    "Arn": { "Fn::GetAtt" : [ "EbsBackupSnapper", "Arn" ] },
+                    "Id": "TargetFunctionV1"
+                }]
+            }
+        },
+
+        "SnapshotDeleteRule": {
+            "Type": "AWS::Events::Rule",
+            "Properties": {
+                "Description": "ScheduledRule to delete Snapshots",
+                "ScheduleExpression": { "Ref" : "SnapshotDeleteCRON" },
+                "State": "ENABLED",
+                "Targets": [{
+                    "Arn": { "Fn::GetAtt" : [ "EbsBackupJanitor", "Arn" ] },
+                    "Id": "TargetFunctionV2"
+                }]
+            }
+        },
+        "EbsBackupExecutionRole": {
+            "Type": "AWS::IAM::Role",
+            "Properties": {
+                "AssumeRolePolicyDocument": {
+                    "Version": "2012-10-17",
+                    "Statement": [
+                        {
+                            "Effect": "Allow",
+                            "Principal": {
+                                "Service": ["lambda.amazonaws.com"]
+                            },
+                            "Action": ["sts:AssumeRole"]
+                        }
+                    ]
+                },
+            }
+        },
+        "EbsBackupExecutionPolicy": {
+            "DependsOn": [
+                "EbsBackupExecutionRole"
+            ],
+            "Type": "AWS::IAM::Policy",
+            "Properties": {
+                "PolicyName": "AllowBackupLambdaFunction",
+                "Roles": [
+                    {"Ref": "EbsBackupExecutionRole"}
+                ],
+                "PolicyDocument": {
+                    "Version": "2012-10-17",
+                    "Statement": [
+                        {
+                            "Effect": "Allow",
+                            "Action": ["logs:*"],
+                            "Resource": ["arn:aws:logs:*:*:*"]
+                        },
+                        {
+                            "Effect": "Allow",
+                            "Action": [
+                                "ec2:Describe*",
+                                "ec2:CreateSnapshot",
+                                "ec2:DeleteSnapshot",
+                                "ec2:CreateTags",
+                                "ec2:ModifySnapshotAttribute",
+                                "ec2:ResetSnapshotAttribute"
+
+                            ],
+                            "Resource": ["*"]
+                        }
+                    ]
+                }
+            }
+        },
+        "PermissionForEventsToInvokeSnapper": {
+            "Type": "AWS::Lambda::Permission",
+            "Properties": {
+                "FunctionName": { 
+                    "Ref": "EbsBackupSnapper"
+                },
+                "Action": "lambda:InvokeFunction",
+                "Principal": "events.amazonaws.com"
+            }
+        },
+        "PermissionForEventsToInvokeJanitor": {
+            "Type": "AWS::Lambda::Permission",
+            "Properties": {
+                "FunctionName": { 
+                    "Ref": "EbsBackupJanitor"
+                },
+                "Action": "lambda:InvokeFunction",
+                "Principal": "events.amazonaws.com"
+            }
+        },
+
+        "EbsBackupSnapper": {
+            "Type": "AWS::Lambda::Function",
+            "DependsOn": [
+                "EbsBackupExecutionRole",
+                "EbsBackupExecutionPolicy"
+            ],
+            "Properties": {
+                "Code": {
+                    "ZipFile" : {
+                        "Fn::Join" : [
+                            "\n",
+                            [
+                                "import boto3",
+                                "import collections",
+                                "import datetime",
+                                "",
+                                "ec = boto3.client('ec2')",
+                                "",
+                                "def lambda_handler(event, context):",
+                                "    reservations = ec.describe_instances(",
+                                "            Filters=[",
+                                "                {'Name': 'tag:Backup', 'Values': ['True']},",
+                                "            ]",
+                                "        ).get(",
+                                "            'Reservations', []",
+                                "        )",
+                                "",
+                                "    instances = sum(",
+                                "        [",
+                                "            [i for i in r['Instances']]",
+                                "            for r in reservations",
+                                "        ], [])",
+                                "",
+                                "    print 'Number of the Instances : %d' % len(instances)",
+                                "",
+                                "    to_tag = collections.defaultdict(list)",
+                                "",
+                                "    for instance in instances:",
+                                "            try:",
+                                "                retention_days = [",
+                                "                    int(t.get('Value')) for t in instance['Tags']",
+                                "                    if t['Key'] == 'Retention'][0]",
+                                "            except IndexError:",
+                                "                # Please give your retention period day",
+                                "                retention_days = 60",
+                                    "",
+                                "            for dev in instance['BlockDeviceMappings']:",
+                                "                if dev.get('Ebs', None) is None:",
+                                "                    continue",
+                                "                vol_id = dev['Ebs']['VolumeId']",
+                                "                for name in instance['Tags']:",
+                                "                    # To store the instance tag value",
+                                "                    Instancename= name['Value']",
+                                "                    # To store the instance key value",
+                                "                    key= name['Key']",
+                                "                    # Below the code is create Snapshot name as instance Name ",
+                                "                    if key == 'Name' :",
+                                "                        ins_name = Instancename",
+                                "                        print 'Found EBS volume %s on instance %s' % (",
+                                "                        vol_id, instance['InstanceId'])",
+                                                "",
+                                "                #To get all the instance tags deatils",
+                                "                for name in instance['Tags']:",
+                                "                    # To store the instance tag value",
+                                "                    Instancename= name['Value']",
+                                "                    # To store the instance key value",
+                                "                    key= name['Key']",
+                                "                    # Below the code is create Snapshot name as instance Name ",
+                                "                    if key == 'Name' :",
+                                "                        snap = ec.create_snapshot(",
+                                "                        VolumeId=vol_id,",
+                                "                        Description=Instancename,",
+                                "                        )",
+                                "                        print 'snap %s' %snap",
+                                    "",
+                                "                to_tag[retention_days].append(snap['SnapshotId'])",
+                                    "",
+                                "                print 'Retaining snapshot %s of volume %s from instance %s for %d days' % (",
+                                "                    snap['SnapshotId'],",
+                                "                    vol_id,",
+                                "                    instance['InstanceId'],",
+                                "                    retention_days,",
+                                                    "",
+                                "                )",
+                                "                for retention_days in to_tag.keys():",
+                                "                    delete_date = datetime.date.today() + datetime.timedelta(days=retention_days)",
+                                "                    snap = snap['Description'] + str('_')",
+                                "                    # Here to get current date ",
+                                "                    snapshot = snap + str(datetime.date.today())   ",
+                                "                    # to mention the current date formet",
+                                "                    delete_fmt = delete_date.strftime('%Y-%m-%d')",
+                                "                    print 'Will delete %d snapshots on %s' % (len(to_tag[retention_days]), delete_fmt)",
+                                "                    # below code is create the name and current date as instance name",
+                                "                    ec.create_tags(",
+                                "                    Resources=to_tag[retention_days],",
+                                "                    Tags=[",
+                                "                    {'Key': 'DeleteOn', 'Value': delete_fmt},",
+                                "                    {'Key': 'Name', 'Value': snapshot },",
+                                "                    ]",
+                                "                    ) ",
+                                "            to_tag.clear()",
+                            ]
+                        ]    
+                    }        
+                },
+                "Role": {
+                    "Fn::GetAtt": ["EbsBackupExecutionRole", "Arn"]
+                },
+                "Timeout": 180,
+                "Handler": "index.lambda_handler",
+                "Runtime": "python2.7",
+                "MemorySize": 128
+            }
+        },
+        "EbsBackupJanitor": {
+            "Type": "AWS::Lambda::Function",
+            "DependsOn": [
+                "EbsBackupExecutionRole",
+                "EbsBackupExecutionPolicy"
+            ],
+            "Properties": {
+                "Code": {
+                    "ZipFile" : {
+                        "Fn::Join" : [
+                            "\n",
+                            [
+                                "import boto3",
+                                "import re",
+                                "import datetime",
+                                "",
+                                "#Please mention your region name",
+                                "#below line code can be cross region",
+                                "ec = boto3.client('ec2')",
+                                "iam = boto3.client('iam')",
+                                "account_ids=list()",
+                                "#begins lambda function",
+                                "def lambda_handler(event, context):",
+                                "",
+                                "    delete_on = datetime.date.today().strftime('%Y-%m-%d')",
+                                "    filters = [",
+                                "            {'Name': 'tag-key', 'Values': ['DeleteOn']},",
+                                "            {'Name': 'tag-value', 'Values': [delete_on]},",
+                                "        ]",
+                                "    snapshot_response = ec.describe_snapshots(OwnerIds=account_ids, Filters=filters)",
+                                "",
+                                "    for res in snapshot_response:",
+                                "        print(snapshot_response['Snapshots'])",
+                                "",
+                                "    for snap in snapshot_response['Snapshots']:",
+                                "        print 'Deleting snapshot %s' % snap['SnapshotId']",
+                                "        ec.delete_snapshot(SnapshotId=snap['SnapshotId'])",
+
+                            ]
+                        ]
+                    }
+                },
+                "Role": {
+                    "Fn::GetAtt": ["EbsBackupExecutionRole", "Arn"]
+                },
+                "Timeout": 180,
+                "Handler": "index.lambda_handler",
+                "Runtime": "python2.7",
+                "MemorySize": 128
+            }
+        }
+    }
+}
